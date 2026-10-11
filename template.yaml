@@ -1,0 +1,690 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS Bench Training assignment - Task Tracker.
+  VPC, RDS PostgreSQL, ECR, ECS Fargate + ALB, CloudWatch monitoring,
+  ECS Auto Scaling, and a CodePipeline CI/CD pipeline (S3 source → CodeBuild → ECS).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: task-tracker
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    AllowedValues: [db.t4g.micro, db.t4g.small, db.t3.micro, db.t3.small]
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+
+  DBName:
+    Type: String
+    Default: taskdb
+
+  DBMasterUsername:
+    Type: String
+    Default: taskadmin
+
+  DBBackupRetentionDays:
+    Type: Number
+    Default: 1
+
+  ECSTaskCpu:
+    Type: String
+    Default: '256'
+    AllowedValues: ['256', '512', '1024']
+
+  ECSTaskMemory:
+    Type: String
+    Default: '512'
+    AllowedValues: ['512', '1024', '2048']
+
+  ECSDesiredCount:
+    Type: Number
+    Default: 0
+
+  ContainerImageTag:
+    Type: String
+    Default: latest
+
+  AlertEmail:
+    Type: String
+    Description: Email address for CloudWatch alarm notifications.
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+    Description: Deployment environment - controls scaling limits.
+
+Mappings:
+  EnvConfig:
+    dev:
+      MaxCapacity: 2
+      ScaleOutCooldown: 120
+    prod:
+      MaxCapacity: 6
+      ScaleOutCooldown: 60
+
+Resources:
+
+  # -------------------- VPC --------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-vpc"}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-public-1"}]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-public-2"}]
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-private-1"}]
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-private-2"}]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # -------------------- Security Groups --------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP from internet to ALB only.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-alb-sg"}]
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App port from ALB only.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref AlbSecurityGroup}
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-service-sg"}]
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Postgres from ECS service only.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref ServiceSecurityGroup}
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-db-sg"}]
+
+  # -------------------- RDS --------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets - DB never in public subnet.
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-db"
+      Engine: postgres
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBMasterUsername
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref DBSecurityGroup]
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: !Ref DBBackupRetentionDays
+      DeletionProtection: false
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-db"}]
+
+  # -------------------- ECR --------------------
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    Properties:
+      RepositoryName: !Ref ProjectName
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: >
+          {"rules":[{"rulePriority":1,"description":"Keep last 10 images",
+          "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},
+          "action":{"type":"expire"}}]}
+
+  # -------------------- Logging --------------------
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}"
+      RetentionInDays: 14
+
+  # -------------------- IAM --------------------
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-ecs-execution-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ReadDbSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: secretsmanager:GetSecretValue, Resource: !GetAtt DBInstance.MasterUserSecret.SecretArn}
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-ecs-task-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-codebuild-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: codebuild.amazonaws.com}, Action: sts:AssumeRole}
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents], Resource: '*'}
+              - {Effect: Allow, Action: [ecr:GetAuthorizationToken, ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage, ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload, ecr:PutImage], Resource: '*'}
+              - {Effect: Allow, Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject], Resource: !Sub "arn:aws:s3:::${ArtifactBucket}/*"}
+              - {Effect: Allow, Action: [ecs:DescribeTaskDefinition], Resource: '*'}
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-codepipeline-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: codepipeline.amazonaws.com}, Action: sts:AssumeRole}
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: [s3:GetObject, s3:GetObjectVersion, s3:GetBucketVersioning, s3:PutObject, s3:PutObjectAcl], Resource: ['*']}
+              - {Effect: Allow, Action: [codebuild:BatchGetBuilds, codebuild:StartBuild], Resource: '*'}
+              - {Effect: Allow, Action: [ecs:DescribeServices, ecs:DescribeTaskDefinition, ecs:DescribeTasks, ecs:ListTasks, ecs:RegisterTaskDefinition, ecs:UpdateService], Resource: '*'}
+              - {Effect: Allow, Action: [iam:PassRole], Resource: '*'}
+
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-autoscaling-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: application-autoscaling.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole
+
+  # -------------------- S3 Artifact Bucket --------------------
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${ProjectName}-artifacts-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+
+  # -------------------- ECS --------------------
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-cluster"
+      ClusterSettings:
+        - {Name: containerInsights, Value: enabled}
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-task"
+      Cpu: !Ref ECSTaskCpu
+      Memory: !Ref ECSTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub "${ECRRepository.RepositoryUri}:${ContainerImageTag}"
+          PortMappings:
+            - {ContainerPort: 8080, Protocol: tcp}
+          Environment:
+            - Name: SPRING_DATASOURCE_URL
+              Value: !Sub "jdbc:postgresql://${DBInstance.Endpoint.Address}:${DBInstance.Endpoint.Port}/${DBName}"
+          Secrets:
+            - Name: SPRING_DATASOURCE_USERNAME
+              ValueFrom: !Sub "${DBInstance.MasterUserSecret.SecretArn}:username::"
+            - Name: SPRING_DATASOURCE_PASSWORD
+              ValueFrom: !Sub "${DBInstance.MasterUserSecret.SecretArn}:password::"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-tg"
+      VpcId: !Ref VPC
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - {Type: forward, TargetGroupArn: !Ref TargetGroup}
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      ServiceName: !Sub "${ProjectName}-service"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref ECSDesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+      LoadBalancers:
+        - {ContainerName: app, ContainerPort: 8080, TargetGroupArn: !Ref TargetGroup}
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+
+  # -------------------- ECS Auto Scaling --------------------
+  ECSScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: ECSService
+    Properties:
+      MaxCapacity: !FindInMap [EnvConfig, !Ref EnvironmentName, MaxCapacity]
+      MinCapacity: 1
+      ResourceId: !Sub "service/${ECSCluster}/${ECSService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !GetAtt AutoScalingRole.Arn
+
+  ECSScalingPolicyCPU:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-cpu-scaling"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ECSScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 60.0
+        ScaleOutCooldown: !FindInMap [EnvConfig, !Ref EnvironmentName, ScaleOutCooldown]
+        ScaleInCooldown: 300
+
+  # -------------------- CodeBuild --------------------
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectName}-build"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - {Name: ECR_REPO_URI, Value: !GetAtt ECRRepository.RepositoryUri}
+          - {Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region}
+          - {Name: AWS_ACCOUNT_ID, Value: !Ref AWS::AccountId}
+          - {Name: IMAGE_TAG, Value: latest}
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref ECSLogGroup
+          StreamName: codebuild
+
+  # -------------------- CodePipeline --------------------
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${ProjectName}-pipeline"
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: S3Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                S3Bucket: !Ref ArtifactBucket
+                S3ObjectKey: source.zip
+                PollForSourceChanges: true
+              OutputArtifacts:
+                - Name: SourceArtifact
+        - Name: Build
+          Actions:
+            - Name: DockerBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+        - Name: Deploy
+          Actions:
+            - Name: ECSDeployBlueGreen
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: '1'
+              Configuration:
+                ClusterName: !Ref ECSCluster
+                ServiceName: !GetAtt ECSService.Name
+                FileName: imagedefinitions.json
+              InputArtifacts:
+                - Name: BuildArtifact
+
+  # -------------------- Monitoring --------------------
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-alarms"
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  ServiceHighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-ecs-high-cpu"
+      AlarmDescription: ECS CPU above 80% for 10 min.
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Dimensions:
+        - {Name: ClusterName, Value: !Ref ECSCluster}
+        - {Name: ServiceName, Value: !GetAtt ECSService.Name}
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  AlbHighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-alb-high-latency"
+      AlarmDescription: ALB target response time above 2 sec.
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt ALB.LoadBalancerFullName}
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  AlbHighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-alb-5xx-errors"
+      AlarmDescription: ALB 5xx errors above 10 in 5 min.
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt ALB.LoadBalancerFullName}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  DbHighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-rds-high-cpu"
+      AlarmDescription: RDS CPU above 80% for 10 min.
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - {Name: DBInstanceIdentifier, Value: !Ref DBInstance}
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-dashboard"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "ECS - CPU & Memory Utilization",
+                "view": "timeSeries", "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/ECS","CPUUtilization","ClusterName","${ECSCluster}","ServiceName","${ECSService.Name}"],
+                  ["AWS/ECS","MemoryUtilization","ClusterName","${ECSCluster}","ServiceName","${ECSService.Name}"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "ALB - Request Count, Latency & Error Rate",
+                "view": "timeSeries", "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/ApplicationELB","RequestCount","LoadBalancer","${ALB.LoadBalancerFullName}"],
+                  ["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","${ALB.LoadBalancerFullName}"],
+                  ["AWS/ApplicationELB","HTTPCode_ELB_5XX_Count","LoadBalancer","${ALB.LoadBalancerFullName}"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "RDS - CPU, Connections & Free Storage",
+                "view": "timeSeries", "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/RDS","CPUUtilization","DBInstanceIdentifier","${DBInstance}"],
+                  ["AWS/RDS","DatabaseConnections","DBInstanceIdentifier","${DBInstance}"],
+                  ["AWS/RDS","FreeStorageSpace","DBInstanceIdentifier","${DBInstance}"]
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ApplicationURL:
+    Value: !Sub "http://${ALB.DNSName}"
+
+  ECRRepositoryUri:
+    Value: !GetAtt ECRRepository.RepositoryUri
+
+  ArtifactBucketName:
+    Description: Upload source.zip here to trigger the pipeline.
+    Value: !Ref ArtifactBucket
+
+  RDSEndpoint:
+    Value: !GetAtt DBInstance.Endpoint.Address
+
+  DBSecretArn:
+    Value: !GetAtt DBInstance.MasterUserSecret.SecretArn
+
+  ClusterName:
+    Value: !Ref ECSCluster
+
+  ServiceName:
+    Value: !GetAtt ECSService.Name
+
+  LogGroupName:
+    Value: !Ref ECSLogGroup
+
+  DashboardURL:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-dashboard"
